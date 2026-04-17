@@ -1,195 +1,234 @@
 """
-FlagOS Track 3: LLM Automatic Data Annotation in Long-Context Scenarios
-=====================================================================
-ICL (In-Context Learning) based solution for automatic data annotation
-using Qwen3-4B model.
+AnnotateX: LLM Automatic Data Annotation in Long-Context Scenarios
+===================================================================
+FlagOS Open Computing Hackathon - Track 3
+ICL (In-Context Learning) based solution using Qwen3-4B.
 
-This script is designed to run on Kaggle with GPU acceleration.
-Approach: Multi-strategy ICL with chain-of-thought, self-consistency,
-and long-context window optimization.
+Handles 8 diverse OpenSeek tasks:
+  1. Closest Integers (math)
+  2. Count Nouns & Verbs (NLP)
+  3. Collatz Conjecture (math)
+  4. Concat Strings (code)
+  5. Tweet Sadness Detection (binary classification)
+  6. MNLI Genre Classification (binary classification)
+  7. Jeopardy Answer Generation (QA)
+  8. Kernel Generation (code generation)
 """
 
 import json
 import os
+import glob
 import random
 import re
 import time
 from typing import Dict, List, Optional, Tuple
+from collections import Counter
 
 import numpy as np
 import pandas as pd
 import torch
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    pipeline,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 class Config:
-    # Model
-    MODEL_NAME = "Qwen/Qwen3-4B"  # or FlagOS-specific variant
-    MAX_LENGTH = 32768  # Qwen3 native max context
-    MAX_NEW_TOKENS = 512
-    TEMPERATURE = 0.3  # Low temp for annotation consistency
-    TOP_P = 0.9
-    TOP_K = 50
+    MODEL_NAME = "Qwen/Qwen3-4B"
+    MAX_NEW_TOKENS = 256
+    TEMPERATURE = 0.1
+    TOP_P = 0.85
+    NUM_SHOT = 5
+    SELF_CONSISTENCY_RUNS = 1
+    USE_4BIT = True
+    MAX_INPUT_TOKENS = 30000
 
-    # ICL Settings
-    NUM_SHOT_EXAMPLES = 5  # Number of few-shot examples
-    CHAIN_OF_THOUGHT = True  # Enable CoT reasoning
-    SELF_CONSISTENCY_RUNS = 3  # Multiple runs for self-consistency
-
-    # Data
     INPUT_DIR = "/kaggle/input/track-3-llm-automatic-data-annotation-in-long-context-scenarios"
-    OUTPUT_DIR = "/kaggle/working"
-    BATCH_SIZE = 1  # Process one at a time for long context
-
-    # Optimization
-    USE_4BIT = True  # 4-bit quantization for memory efficiency
-    FLASH_ATTENTION = True
+    OUTPUT_PATH = "/kaggle/working/submission.csv"
 
 
 # ============================================================
-# ICL PROMPT ENGINEERING
+# DATA LOADER
 # ============================================================
-class ICLPromptBuilder:
-    """Builds optimized ICL prompts for data annotation tasks."""
+class TaskLoader:
+    """Loads and manages multi-task OpenSeek data."""
+
+    def __init__(self, input_dir: str):
+        self.input_dir = input_dir
+        self.tasks = []
+        self.all_test_samples = []
+
+    def load(self) -> List[Dict]:
+        """Load all JSON task files."""
+        json_files = sorted(glob.glob(os.path.join(self.input_dir, "*.json")))
+        print(f"Found {len(json_files)} task files")
+
+        for fpath in json_files:
+            with open(fpath, 'r') as f:
+                data = json.load(f)
+
+            definition = data['Definition'][0] if isinstance(data['Definition'], list) else data['Definition']
+            examples = data['examples']
+            test_samples = data['test_samples']
+
+            # Determine output types
+            sample_outputs = [
+                str(ex['output'][0]) if isinstance(ex['output'], list) else str(ex['output'])
+                for ex in examples[:50]
+            ]
+            unique_outputs = list(set(sample_outputs))
+            is_binary = len(unique_outputs) == 2
+            is_classification = len(unique_outputs) <= 10
+
+            task = {
+                'task_id': data['task_id'],
+                'task_name': data['task_name'],
+                'definition': definition,
+                'examples': examples,
+                'test_samples': test_samples,
+                'is_binary': is_binary,
+                'is_classification': is_classification,
+                'output_types': unique_outputs[:5],
+            }
+            self.tasks.append(task)
+
+            # Collect test samples
+            for ts in test_samples:
+                self.all_test_samples.append({
+                    'id': ts['id'],
+                    'input': ts['input'],
+                    'task_id': data['task_id'],
+                    'task_name': data['task_name'],
+                })
+
+            print(f"  {data['task_id']:20s} | ex={len(examples):5d} | test={len(test_samples):4d} | binary={is_binary}")
+
+        print(f"\nTotal: {len(self.all_test_samples)} test samples across {len(self.tasks)} tasks")
+        return self.tasks
+
+
+# ============================================================
+# PROMPT BUILDER
+# ============================================================
+class PromptBuilder:
+    """Builds task-specific ICL prompts using Qwen3 chat template."""
 
     def __init__(self, config: Config):
         self.config = config
-        self.system_prompt = (
-            "You are an expert data annotator specializing in long-context understanding. "
-            "Your task is to carefully read the provided context and annotate the target "
-            "text according to the given label schema. Think step-by-step to ensure accuracy.\n\n"
-            "Instructions:\n"
-            "1. Read the full context carefully\n"
-            "2. Identify the relevant information for annotation\n"
-            "3. Consider the label definitions provided\n"
-            "4. Apply the annotation with confidence\n"
-            "5. If uncertain, choose the most probable label"
+
+    def build_prompt(self, task: Dict, test_input, tokenizer) -> str:
+        """Build ICL prompt for a specific task and test input."""
+        definition = task['definition']
+        examples = task['examples']
+        num_shot = self.config.NUM_SHOT
+
+        # Select diverse few-shot examples
+        if task['is_classification'] and task['is_binary']:
+            labels = [
+                str(ex['output'][0]) if isinstance(ex['output'], list) else str(ex['output'])
+                for ex in examples
+            ]
+            unique_labels = list(set(labels))
+            selected = []
+            per_label = max(1, num_shot // len(unique_labels))
+            for lbl in unique_labels:
+                matching = [
+                    ex for ex in examples
+                    if str(ex['output'][0] if isinstance(ex['output'], list) else ex['output']) == lbl
+                ]
+                selected.extend(random.sample(matching, min(per_label, len(matching))))
+            random.shuffle(selected)
+            selected = selected[:num_shot]
+        else:
+            selected = random.sample(examples, min(num_shot, len(examples)))
+
+        # Build messages for chat template
+        messages = []
+
+        system_msg = (
+            f"You are an expert assistant. Your task is: {definition}\n\n"
+            "Follow the format of the examples below. Provide only the answer, nothing else."
         )
+        messages.append({"role": "system", "content": system_msg})
 
-    def build_annotation_prompt(
-        self,
-        context: str,
-        target_text: str,
-        label_schema: List[str],
-        examples: Optional[List[Dict]] = None,
-    ) -> str:
-        """Build a complete ICL prompt for annotation."""
-        prompt_parts = []
+        # Few-shot examples
+        examples_text = ""
+        for i, ex in enumerate(selected):
+            inp = str(ex['input'])
+            out = str(ex['output'][0]) if isinstance(ex['output'], list) else str(ex['output'])
+            examples_text += f"\nExample {i+1}:\nInput: {inp}\nOutput: {out}\n"
 
-        # System instruction
-        prompt_parts.append(f"<|im_start|>system\n{self.system_prompt}<|im_end|>")
+        user_msg = f"Here are some examples:\n{examples_text}\n\nNow solve this:\nInput: {str(test_input)}\nOutput:"
+        messages.append({"role": "user", "content": user_msg})
 
-        # User message with ICL examples
-        prompt_parts.append("<|im_start|>user")
-
-        # Label schema
-        schema_str = ", ".join(label_schema)
-        prompt_parts.append(
-            f"Label Schema: [{schema_str}]\n\n"
-            "Here are some annotated examples:\n"
-        )
-
-        # Add few-shot examples if provided
-        if examples:
-            for i, ex in enumerate(examples, 1):
-                prompt_parts.append(
-                    f"\nExample {i}:\n"
-                    f"Context: {ex['context']}\n"
-                    f"Target Text: {ex['target']}\n"
-                )
-                if self.config.CHAIN_OF_THOUGHT:
-                    prompt_parts.append(
-                        f"Reasoning: {ex.get('reasoning', 'N/A')}\n"
-                    )
-                prompt_parts.append(f"Annotation: {ex['label']}\n")
-
-        # The actual task
-        prompt_parts.append(
-            f"\nNow annotate the following:\n"
-            f"Context: {context}\n"
-            f"Target Text: {target_text}\n"
-        )
-
-        if self.config.CHAIN_OF_THOUGHT:
-            prompt_parts.append(
-                "Please think step by step and provide your reasoning, "
-                "then give the final annotation.\n"
+        # Apply chat template
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
             )
+        except Exception:
+            # Fallback manual template
+            prompt = ""
+            for msg in messages:
+                if msg['role'] == 'system':
+                    prompt += f"<|im_start|>system\n{msg['content']}<|im_end|>\n"
+                elif msg['role'] == 'user':
+                    prompt += f"<|im_start|>user\n{msg['content']}<|im_end|>\n"
+            prompt += "<|im_start|>assistant\n"
 
-        prompt_parts.append("<|im_end|>")
-
-        # Assistant response prefix
-        prompt_parts.append("<|im_start|>assistant")
-
-        return "\n".join(prompt_parts)
-
-    def build_long_context_prompt(
-        self,
-        documents: List[str],
-        query: str,
-        task_description: str,
-        examples: Optional[List[Dict]] = None,
-    ) -> str:
-        """Build a prompt optimized for long-context scenarios."""
-        prompt_parts = []
-
-        prompt_parts.append(
-            f"<|im_start|>system\n"
-            f"{self.system_prompt}\n\n"
-            f"Task: {task_description}<|im_end|>"
-        )
-
-        prompt_parts.append("<|im_start|>user")
-
-        # Concatenate documents for long-context
-        combined_docs = "\n\n---\n\n".join(documents)
-        # Truncate if too long (keep last N tokens worth)
-        max_doc_chars = 20000  # Conservative limit
-        if len(combined_docs) > max_doc_chars:
-            combined_docs = combined_docs[-max_doc_chars:]
-            combined_docs = "...[truncated]...\n" + combined_docs
-
-        prompt_parts.append(
-            f"## Reference Documents\n{combined_docs}\n\n"
-            f"## Query\n{query}\n"
-        )
-
-        if self.config.CHAIN_OF_THOUGHT:
-            prompt_parts.append(
-                "\nPlease analyze the reference documents carefully, "
-                "reason step by step, and provide your annotation."
-            )
-
-        prompt_parts.append("<|im_end|>")
-        prompt_parts.append("<|im_start|>assistant")
-
-        return "\n".join(prompt_parts)
+        return prompt
 
 
 # ============================================================
-# ANNOTATION ENGINE
+# ANSWER EXTRACTOR
+# ============================================================
+class AnswerExtractor:
+    """Extracts clean answers from model responses."""
+
+    @staticmethod
+    def extract(response: str, task: Dict) -> str:
+        """Extract answer based on task type."""
+        resp = response.strip()
+
+        # For classification tasks, find matching label
+        if task['is_classification']:
+            for label in task['output_types']:
+                if label.lower() in resp.lower():
+                    return label
+
+        # Try "Output:" pattern
+        match = re.search(r'Output:\s*(.+?)(?:\n|$)', resp, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+        # Handle thinking models
+        think_match = re.search(r'</think[^>]*>\s*(.+)', resp, re.DOTALL)
+        if think_match:
+            return think_match.group(1).strip()
+
+        # Fallback: first line
+        first_line = resp.split('\n')[0].strip()
+        return first_line if first_line else resp
+
+
+# ============================================================
+# ICL ENGINE
 # ============================================================
 class ICLEngine:
-    """Main engine for ICL-based data annotation."""
+    """Main inference engine."""
 
     def __init__(self, config: Config):
         self.config = config
-        self.prompt_builder = ICLPromptBuilder(config)
         self.model = None
         self.tokenizer = None
+        self.prompt_builder = PromptBuilder(config)
+        self.extractor = AnswerExtractor()
 
     def load_model(self):
-        """Load Qwen3-4B with quantization for efficiency."""
-        print(f"Loading model: {self.config.MODEL_NAME}")
+        """Load Qwen3-4B with optional 4-bit quantization."""
+        print(f"Loading {self.config.MODEL_NAME}...")
+        t0 = time.time()
 
-        # Quantization config for memory efficiency
         bnb_config = None
         if self.config.USE_4BIT:
             bnb_config = BitsAndBytesConfig(
@@ -199,45 +238,26 @@ class ICLEngine:
                 bnb_4bit_use_double_quant=True,
             )
 
-        # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.MODEL_NAME,
-            trust_remote_code=True,
-            padding_side="left",
+            self.config.MODEL_NAME, trust_remote_code=True, padding_side="left"
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Load model
-        model_kwargs = {
-            "trust_remote_code": True,
-            "torch_dtype": torch.float16,
-            "device_map": "auto",
-        }
+        kwargs = {"trust_remote_code": True, "torch_dtype": torch.float16, "device_map": "auto"}
         if bnb_config:
-            model_kwargs["quantization_config"] = bnb_config
+            kwargs["quantization_config"] = bnb_config
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.config.MODEL_NAME,
-            **model_kwargs,
-        )
+        self.model = AutoModelForCausalLM.from_pretrained(self.config.MODEL_NAME, **kwargs)
         self.model.eval()
 
-        print("Model loaded successfully!")
-        print(f"Device: {self.model.device}")
-        print(f"Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        print(f"Model loaded in {time.time()-t0:.1f}s")
 
-    def generate_annotation(
-        self,
-        prompt: str,
-        temperature: Optional[float] = None,
-    ) -> str:
-        """Generate a single annotation."""
+    def generate(self, prompt: str, temperature: float = None) -> str:
+        """Generate model response."""
         inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.config.MAX_LENGTH,
+            prompt, return_tensors="pt",
+            truncation=True, max_length=self.config.MAX_INPUT_TOKENS
         ).to(self.model.device)
 
         with torch.no_grad():
@@ -246,384 +266,93 @@ class ICLEngine:
                 max_new_tokens=self.config.MAX_NEW_TOKENS,
                 temperature=temperature or self.config.TEMPERATURE,
                 top_p=self.config.TOP_P,
-                top_k=self.config.TOP_K,
-                do_sample=True,
+                do_sample=(temperature or self.config.TEMPERATURE) > 0,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-        # Decode only the generated part
         generated = outputs[0][inputs.input_ids.shape[1]:]
-        response = self.tokenizer.decode(generated, skip_special_tokens=True)
+        return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
 
-        return response.strip()
-
-    def extract_label(self, response: str, label_schema: List[str]) -> str:
-        """Extract the annotation label from model response."""
-        response_lower = response.lower()
-
-        # Try to find explicit label markers
-        for label in label_schema:
-            if label.lower() in response_lower:
-                return label
-
-        # Try to find "Annotation:" or "Answer:" patterns
-        patterns = [
-            r"annotation:\s*(.+?)(?:\n|$)",
-            r"answer:\s*(.+?)(?:\n|$)",
-            r"label:\s*(.+?)(?:\n|$)",
-            r"final[^:]*:\s*(.+?)(?:\n|$)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, response_lower)
-            if match:
-                candidate = match.group(1).strip()
-                for label in label_schema:
-                    if label.lower() in candidate:
-                        return label
-
-        # Fallback: return first line or most common label word
-        first_line = response.split("\n")[0].strip()
-        for label in label_schema:
-            if label.lower() in first_line.lower():
-                return label
-
-        # Last resort: return the last meaningful token
-        return response.split()[-1] if response else label_schema[0]
-
-    def annotate_with_self_consistency(
-        self,
-        prompt: str,
-        label_schema: List[str],
-        num_runs: int = 3,
-    ) -> Tuple[str, Dict]:
-        """Use self-consistency across multiple generation runs."""
-        label_counts = {}
-        reasoning_samples = []
-
-        for run in range(num_runs):
-            temp = self.config.TEMPERATURE + run * 0.15  # Vary temperature
-            response = self.generate_annotation(prompt, temperature=temp)
-            label = self.extract_label(response, label_schema)
-            label_counts[label] = label_counts.get(label, 0) + 1
-            reasoning_samples.append(response)
-
-        # Majority vote
-        best_label = max(label_counts, key=label_counts.get)
-
-        return best_label, {
-            "label_counts": label_counts,
-            "reasoning_samples": reasoning_samples,
-            "confidence": label_counts[best_label] / num_runs,
-        }
-
-    def process_long_context_sample(
-        self,
-        row: Dict,
-        label_schema: List[str],
-        examples: Optional[List[Dict]] = None,
-    ) -> Dict:
-        """Process a single long-context annotation sample."""
-        # Adapt based on actual data format
-        context = row.get("context", row.get("documents", row.get("text", "")))
-        query = row.get("query", row.get("question", row.get("target", "")))
-        task_desc = row.get("task_description", "Annotate the given text.")
-
-        if isinstance(context, str) and context.startswith("["):
-            try:
-                context = json.loads(context)
-                if isinstance(context, list):
-                    context = "\n\n".join(str(c) for c in context)
-            except json.JSONDecodeError:
-                pass
-
-        prompt = self.prompt_builder.build_long_context_prompt(
-            documents=[str(context)] if not isinstance(context, list) else [str(c) for c in context],
-            query=str(query),
-            task_description=task_desc,
-            examples=examples,
-        )
+    def predict(self, task: Dict, test_input) -> str:
+        """Generate prediction for a single test sample."""
+        prompt = self.prompt_builder.build_prompt(task, test_input, self.tokenizer)
 
         if self.config.SELF_CONSISTENCY_RUNS > 1:
-            label, meta = self.annotate_with_self_consistency(
-                prompt,
-                label_schema,
-                num_runs=self.config.SELF_CONSISTENCY_RUNS,
-            )
+            votes = Counter()
+            for run in range(self.config.SELF_CONSISTENCY_RUNS):
+                temp = self.config.TEMPERATURE + run * 0.1
+                resp = self.generate(prompt, temperature=temp)
+                ans = self.extractor.extract(resp, task)
+                votes[ans] += 1
+            return votes.most_common(1)[0][0]
         else:
-            response = self.generate_annotation(prompt)
-            label = self.extract_label(response, label_schema)
-            meta = {"reasoning": response, "confidence": 1.0}
+            resp = self.generate(prompt)
+            return self.extractor.extract(resp, task)
 
-        return {
-            "label": label,
-            "confidence": meta.get("confidence", 1.0),
-            "reasoning": meta.get("reasoning_samples", [meta.get("reasoning", "")])[0],
-        }
+    def run_all(self, loader: TaskLoader) -> pd.DataFrame:
+        """Process all test samples across all tasks."""
+        task_lookup = {t['task_id']: t for t in loader.tasks}
+        predictions = []
+        total = len(loader.all_test_samples)
+        start = time.time()
 
+        for i, sample in enumerate(loader.all_test_samples):
+            task = task_lookup[sample['task_id']]
 
-# ============================================================
-# DATA LOADING & PREPROCESSING
-# ============================================================
-class DataLoader:
-    """Handles loading and preprocessing competition data."""
+            if i % 10 == 0:
+                elapsed = time.time() - start
+                eta = elapsed / (i + 1) * (total - i - 1) if i > 0 else 0
+                print(f"[{i+1}/{total}] {task['task_id'][:25]:25s} | ETA: {eta/60:.1f}m")
 
-    def __init__(self, config: Config):
-        self.config = config
-        self.label_schema = []
-        self.train_examples = []
-        self.test_samples = []
+            try:
+                answer = self.predict(task, sample['input'])
+            except Exception as e:
+                print(f"  ERROR {sample['id']}: {e}")
+                answer = ""
 
-    def discover_data_files(self):
-        """Discover available data files in the input directory."""
-        print(f"Scanning data directory: {self.config.INPUT_DIR}")
-        if not os.path.exists(self.config.INPUT_DIR):
-            print(f"WARNING: Input directory not found!")
-            return
+            predictions.append({'ID': sample['id'], 'Predicted': answer})
 
-        for root, dirs, files in os.walk(self.config.INPUT_DIR):
-            for f in files:
-                fpath = os.path.join(root, f)
-                fsize = os.path.getsize(fpath)
-                print(f"  Found: {f} ({fsize / 1024:.1f} KB)")
+            if (i + 1) % 50 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    def load_train_data(self) -> pd.DataFrame:
-        """Load training/annotation data."""
-        train_path = os.path.join(
-            self.config.INPUT_DIR, "train.csv"
-        )
-        if not os.path.exists(train_path):
-            # Try alternate names
-            for alt in ["train.json", "train.parquet", "annotations.csv",
-                        "train_data.csv", "annotated_data.csv"]:
-                alt_path = os.path.join(self.config.INPUT_DIR, alt)
-                if os.path.exists(alt_path):
-                    train_path = alt_path
-                    break
+        elapsed = time.time() - start
+        print(f"\nDone! {total} samples in {elapsed/60:.1f}m ({elapsed/total:.1f}s/sample)")
 
-        if os.path.exists(train_path):
-            if train_path.endswith(".json"):
-                df = pd.read_json(train_path)
-            elif train_path.endswith(".parquet"):
-                df = pd.read_parquet(train_path)
-            else:
-                df = pd.read_csv(train_path)
-            print(f"Loaded training data: {df.shape}")
-            print(f"Columns: {list(df.columns)}")
-            print(df.head())
-            return df
-
-        print("No training data found. Will use zero-shot approach.")
-        return pd.DataFrame()
-
-    def load_test_data(self) -> pd.DataFrame:
-        """Load test data for prediction."""
-        test_path = os.path.join(
-            self.config.INPUT_DIR, "test.csv"
-        )
-        if not os.path.exists(test_path):
-            for alt in ["test.json", "test.parquet", "submission.csv",
-                        "test_data.csv", "evaluate.csv"]:
-                alt_path = os.path.join(self.config.INPUT_DIR, alt)
-                if os.path.exists(alt_path):
-                    test_path = alt_path
-                    break
-
-        if os.path.exists(test_path):
-            if test_path.endswith(".json"):
-                df = pd.read_json(test_path)
-            elif test_path.endswith(".parquet"):
-                df = pd.read_parquet(test_path)
-            else:
-                df = pd.read_csv(test_path)
-            print(f"Loaded test data: {df.shape}")
-            print(f"Columns: {list(df.columns)}")
-            print(df.head())
-            return df
-
-        raise FileNotFoundError("No test data found!")
-
-    def load_sample_submission(self) -> pd.DataFrame:
-        """Load sample submission to understand format."""
-        sample_path = os.path.join(
-            self.config.INPUT_DIR, "sample_submission.csv"
-        )
-        if not os.path.exists(sample_path):
-            for alt in ["sample_submission.csv", "sample.csv", "submission_format.csv"]:
-                alt_path = os.path.join(self.config.INPUT_DIR, alt)
-                if os.path.exists(alt_path):
-                    sample_path = alt_path
-                    break
-
-        if os.path.exists(sample_path):
-            df = pd.read_csv(sample_path)
-            print(f"Sample submission format: {df.shape}")
-            print(f"Columns: {list(df.columns)}")
-            print(df.head())
-            return df
-
-        return pd.DataFrame(columns=["ID", "Predicted"])
-
-    def extract_label_schema(self, train_df: pd.DataFrame) -> List[str]:
-        """Extract label schema from training data."""
-        if train_df.empty:
-            return ["positive", "negative", "neutral"]  # Default
-
-        label_col = None
-        for col in ["label", "annotation", "category", "class", "target"]:
-            if col in train_df.columns:
-                label_col = col
-                break
-
-        if label_col:
-            labels = train_df[label_col].unique().tolist()
-            print(f"Discovered label schema: {labels}")
-            return labels
-
-        return ["positive", "negative", "neutral"]
-
-    def prepare_icl_examples(
-        self, train_df: pd.DataFrame, num_examples: int = 5
-    ) -> List[Dict]:
-        """Prepare ICL few-shot examples from training data."""
-        if train_df.empty:
-            return []
-
-        examples = []
-        # Get diverse examples by sampling across labels
-        label_col = None
-        for col in ["label", "annotation", "category", "class", "target"]:
-            if col in train_df.columns:
-                label_col = col
-                break
-
-        context_col = None
-        for col in ["context", "documents", "text", "input", "passage"]:
-            if col in train_df.columns:
-                context_col = col
-                break
-
-        query_col = None
-        for col in ["query", "question", "target_text", "target"]:
-            if col in train_df.columns:
-                query_col = col
-                break
-
-        if label_col and context_col:
-            # Stratified sample
-            labels = train_df[label_col].unique()
-            per_label = max(1, num_examples // len(labels))
-            for label in labels:
-                subset = train_df[train_df[label_col] == label]
-                sampled = subset.sample(
-                    n=min(per_label, len(subset)),
-                    random_state=42,
-                )
-                for _, row in sampled.iterrows():
-                    example = {
-                        "context": str(row[context_col])[:2000],  # Truncate
-                        "target": str(row[query_col]) if query_col else "",
-                        "label": str(row[label_col]),
-                        "reasoning": f"The context suggests the annotation is '{row[label_col]}' "
-                                     f"because the key indicators match this category.",
-                    }
-                    examples.append(example)
-
-        random.shuffle(examples)
-        return examples[:num_examples]
+        return pd.DataFrame(predictions)
 
 
 # ============================================================
-# MAIN EXECUTION
+# MAIN
 # ============================================================
 def main():
     print("=" * 60)
-    print("FlagOS Track 3: ICL Automatic Data Annotation")
+    print("AnnotateX: FlagOS Track 3 - ICL Data Annotation")
     print("=" * 60)
+
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
 
     config = Config()
 
-    # Step 1: Discover and load data
-    print("\n[Step 1] Loading data...")
-    loader = DataLoader(config)
-    loader.discover_data_files()
+    # Load data
+    loader = TaskLoader(config.INPUT_DIR)
+    loader.load()
 
-    train_df = loader.load_train_data()
-    test_df = loader.load_test_data()
-    sample_sub = loader.load_sample_submission()
-
-    label_schema = loader.extract_label_schema(train_df)
-    icl_examples = loader.prepare_icl_examples(train_df, config.NUM_SHOT_EXAMPLES)
-
-    print(f"\nLabel schema: {label_schema}")
-    print(f"ICL examples: {len(icl_examples)}")
-    print(f"Test samples: {len(test_df)}")
-
-    # Step 2: Load model
-    print("\n[Step 2] Loading model...")
+    # Load model & generate
     engine = ICLEngine(config)
     engine.load_model()
 
-    # Step 3: Generate predictions
-    print("\n[Step 3] Generating predictions...")
-    predictions = []
+    sub_df = engine.run_all(loader)
 
-    # Determine ID column
-    id_col = None
-    for col in ["ID", "id", "Id", "sample_id", "index"]:
-        if col in test_df.columns:
-            id_col = col
-            break
+    # Save
+    os.makedirs(os.path.dirname(config.OUTPUT_PATH), exist_ok=True)
+    sub_df.to_csv(config.OUTPUT_PATH, index=False)
 
-    total = len(test_df)
-    for idx, row in test_df.iterrows():
-        sample_id = row[id_col] if id_col else idx
-
-        print(f"\nProcessing {idx + 1}/{total} (ID: {sample_id})...")
-        start_time = time.time()
-
-        try:
-            result = engine.process_long_context_sample(
-                row.to_dict(),
-                label_schema=label_schema,
-                examples=icl_examples,
-            )
-            pred_label = result["label"]
-            confidence = result["confidence"]
-        except Exception as e:
-            print(f"  Error: {e}. Using fallback.")
-            pred_label = label_schema[0]  # Fallback
-            confidence = 0.0
-
-        elapsed = time.time() - start_time
-        print(f"  Prediction: {pred_label} (confidence: {confidence:.2f}, time: {elapsed:.1f}s)")
-
-        predictions.append({
-            "ID": sample_id,
-            "Predicted": pred_label,
-        })
-
-        # Memory management
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    # Step 4: Save submission
-    print("\n[Step 4] Saving submission...")
-    sub_df = pd.DataFrame(predictions)
-
-    # Ensure correct format
-    if not sample_sub.empty:
-        # Use sample submission IDs as ground truth
-        if "ID" in sample_sub.columns:
-            sub_df = sub_df.set_index("ID").reindex(sample_sub["ID"]).reset_index()
-
-    submission_path = os.path.join(config.OUTPUT_DIR, "submission.csv")
-    sub_df.to_csv(submission_path, index=False)
-    print(f"Submission saved to: {submission_path}")
-    print(f"Total predictions: {len(sub_df)}")
-    print(f"\nSubmission preview:")
-    print(sub_df.head(10))
-    print(f"\nLabel distribution:")
-    print(sub_df["Predicted"].value_counts())
+    print(f"\nSubmission saved: {config.OUTPUT_PATH}")
+    print(f"Rows: {len(sub_df)}, Columns: {list(sub_df.columns)}")
+    print(f"\nPreview:")
+    print(sub_df.head(10).to_string(index=False))
 
     return sub_df
 
