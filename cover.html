@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+  @page { size: 794px 1123px; margin: 0; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 794px; height: 1123px; background: #f1f0ee; font-family: 'Inter', 'Times New Roman', serif; }
+  @media screen {
+    html { height: auto; display: flex; justify-content: center; }
+    body { transform-origin: top center; scale: min(1, calc(100vh / 1123)); }
+  }
+  .cover { position: relative; width: 794px; height: 1123px; }
+
+  /* Layer 1 - Background grid */
+  .layer1 { position: absolute; inset: 0; overflow: hidden; z-index: 1; }
+  .grid-bg {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(202,91,54,0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(202,91,54,0.04) 1px, transparent 1px);
+    background-size: 50px 50px;
+  }
+
+  /* Layer 2 - Structure */
+  .layer2 { position: absolute; inset: 0; z-index: 2; }
+  .anchor-line {
+    position: absolute; left: 95px; top: 112px; bottom: 112px;
+    width: 6px; background: #ca5b36;
+  }
+  .meta-line {
+    position: absolute; left: 137px; top: 810px;
+    width: 300px; height: 1px; background: rgba(202,91,54,0.35);
+  }
+
+  /* Layer 3 - Content */
+  .layer3 { position: absolute; inset: 0; z-index: 3; }
+  .kicker {
+    position: absolute; left: 137px; top: 170px;
+    font-size: 14pt; font-weight: 400; letter-spacing: 3pt;
+    color: #ca5b36; opacity: 0.60; text-transform: uppercase;
+  }
+  .hero-title {
+    position: absolute; left: 137px; top: 260px;
+    font-size: 52pt; font-weight: 900; line-height: 1.15;
+    color: #232320; max-width: 600px;
+  }
+  .hero-title .accent { color: #ca5b36; }
+  .summary {
+    position: absolute; left: 137px; top: 480px;
+    font-size: 16pt; font-weight: 400; line-height: 1.65;
+    color: #232320; opacity: 0.85; max-width: 500px;
+  }
+  .meta {
+    position: absolute; left: 137px; top: 830px;
+    font-size: 16pt; font-weight: 400; line-height: 1.8;
+    color: #232320; opacity: 0.85;
+  }
+  .footer {
+    position: absolute; left: 137px; bottom: 60px;
+    font-size: 12pt; font-weight: 400; letter-spacing: 2pt;
+    color: #817d74; opacity: 0.60; text-transform: uppercase;
+  }
+  .comp-badge {
+    position: absolute; right: 60px; bottom: 60px;
+    font-size: 11pt; font-weight: 400; letter-spacing: 1.5pt;
+    color: #817d74; opacity: 0.50; text-transform: uppercase;
+    text-align: right;
+  }
+</style>
+</head>
+<body>
+<div class="cover">
+  <!-- Layer 1: Background -->
+  <div class="layer1">
+    <div class="grid-bg"></div>
+  </div>
+  <!-- Layer 2: Structure -->
+  <div class="layer2">
+    <div class="anchor-line"></div>
+    <div class="meta-line"></div>
+  </div>
+  <!-- Layer 3: Content -->
+  <div class="layer3">
+    <div class="kicker">Technical Report</div>
+    <div class="hero-title"><span class="accent">AnnotateX</span><br>ICL-Powered<br>Automatic Data<br>Annotation</div>
+    <div class="summary">An In-Context Learning engine for automatic data annotation in long-context scenarios, built with Qwen3-4B and FlagScale for the FlagOS Open Computing Global Challenge.</div>
+    <div class="meta">Team: zan-maker<br>Competition: Track 3<br>Date: April 2026</div>
+    <div class="footer">FlagOS Open Computing Global Challenge</div>
+    <div class="comp-badge">FlagOS Community<br>BAAI &bull; CCF ODTC</div>
+  </div>
+</div>
+</body>
+</html>
